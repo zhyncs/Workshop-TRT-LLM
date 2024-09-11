@@ -3,8 +3,10 @@ import asyncio
 import os
 import time
 
-from baseten_client import BasetenAsyncClient
+import numpy as np
 from transformers import AutoTokenizer
+
+from baseten_client import BasetenAsyncClient
 
 BASETEN_API_KEY_ENV_VAR = "BASETEN_API_KEY"
 
@@ -50,24 +52,21 @@ def parse_args():
         "--output_len", type=int, default=1000, help="Specify the output length"
     )
     parser.add_argument("--num_runs", type=int, default=2, help="number of runs")
+    parser.add_argument(
+        "--request_rate",
+        type=float,
+        default=float("inf"),
+        help="Number of requests per second.",
+    )
 
     return parser.parse_args()
 
 
-async def run(model_base_url, input_len, output_len, concurrency, tokenizer):
-    """
-    Do a benchmark run.
-
-    Sends requests in parallel and calculates various metrics such as time taken.
-
-    Note that ttft here is worse that it would normally be. All requests are
-    started at the same time, so all requests content on the context phase. In
-    real world requests won't start at the same time. This can be fixed by adding
-    a jitter to the start time of each request. But that's not implemented here to
-    keep this code simple.
-    """
+async def run(
+    model_base_url, input_len, output_len, concurrency, tokenizer, request_rate
+):
     async with BasetenAsyncClient(
-        url=model_base_url,  # todo, remove mc-dev
+        url=model_base_url,
         api_key=os.environ.get(BASETEN_API_KEY_ENV_VAR),
     ) as client:
 
@@ -78,28 +77,55 @@ async def run(model_base_url, input_len, output_len, concurrency, tokenizer):
                 "prompt": tokenizer.decode(input_ids),
                 "max_tokens": output_len,
             }
-            for i in range(concurrency)
+            for _ in range(concurrency)
         ]
 
         start_time = time.time()
 
-        # Make concurrent requests
-        tasks = [consume(make_request(client, data)) for data in sample_data]
+        async def get_request(
+            sample_data,
+            request_rate: float,
+        ):
+            for data in sample_data:
+                yield data
+                if request_rate != float("inf"):
+                    interval = np.random.exponential(1.0 / request_rate)
+                    await asyncio.sleep(interval)
+
+        tasks = []
+        async for request in get_request(sample_data, request_rate):
+            task = asyncio.create_task(consume(make_request(client, request)))
+            tasks.append(task)
+
         counts = await asyncio.gather(*tasks)
-        total_output_tokens = sum([count[0] for count in counts])
-        ttft = sum([count[1] for count in counts]) / len(counts)
-        # print(counts)
+
+        # Filter out None values or counts where TTFT might not have been set
+        valid_counts = [count for count in counts if count[1] is not None]
+
+        total_output_tokens = sum(count[0] for count in counts if count)
+        if valid_counts:
+            ttft = sum(count[1] for count in valid_counts) / len(valid_counts)
+        else:
+            ttft = None  # or set to some default value or message
 
         end_time = time.time()
 
         # Calculate total time taken
         total_time = end_time - start_time
         print("\tTotal time taken:", total_time, "seconds")
-        print("\tOutput Tps:", (total_output_tokens / total_time))
+        print("\tOutput Tps:", (total_output_tokens / total_time) if total_time else 0)
         print(
-            "\tTotal Tps:", (concurrency * input_len + total_output_tokens) / total_time
+            "\tTotal Tps:",
+            (
+                ((concurrency * input_len + total_output_tokens) / total_time)
+                if total_time
+                else 0
+            ),
         )
-        print("\tTTFT:", ttft * 1000, "ms")
+        print(
+            "\tTTFT:",
+            f"{ttft * 1000:.2f} ms" if ttft is not None else "No valid TTFT recorded",
+        )
 
 
 async def main():
@@ -108,7 +134,7 @@ async def main():
     print(args)
     tokenizer = AutoTokenizer.from_pretrained(args.hf_tokenizer)
     print("Warmup run:")
-    await run(args.model_base_url, 1, 1, 10, tokenizer)
+    await run(args.model_base_url, 1, 1, 10, tokenizer, float("inf"))
 
     print("\nBenchmark runs:")
     for i in range(args.num_runs):
@@ -119,6 +145,7 @@ async def main():
             args.output_len,
             args.concurrency,
             tokenizer,
+            args.request_rate,
         )
 
 
